@@ -7,7 +7,7 @@ WrapIP — Mini Modern Analog Meter (tanpa jarum)
 - Auto cari IP + geo, speedtest otomatis (ping / download / upload).
 - Tombol CONNECT / DISCONNECT untuk ganti IP lewat proxy sistem Windows.
 - Selalu di atas (always-on-top), bisa di-drag, tutup via tombol X.
-- Satu file, CustomTkinter + Tkinter Canvas. Tanpa PIL.
+- Satu file, CustomTkinter + Tkinter Canvas + Pillow (render supersampling).
 """
 
 import ctypes
@@ -26,6 +26,8 @@ from concurrent.futures import TimeoutError as FutureTimeout
 import tkinter as tk
 
 import customtkinter as ctk
+
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 # ---------------------------------------------------------------------------
 # Konstanta tampilan
@@ -59,10 +61,10 @@ CARD_R = 12.0
 
 SMALL_R = 14.0
 SMALL_L = (117.0, 51.0)
+SMALL_M_POS = (180.0, 51.0)
 SMALL_R_POS = (243.0, 51.0)
 
-K_MIN, K_MAX, K_STEP = 0.55, 1.8, 0.08
-
+# ukuran permanen (px) — tidak bisa diubah / scroll
 # warna
 KEY = "#000001"
 BODY = "#12151B"
@@ -79,6 +81,28 @@ C_WARN = "#F26D6D"
 
 FONT = "Segoe UI"
 FONT_MONO = "Consolas"
+
+# render vektor-halus: supersampling PIL (SS x resolusi dasar)
+SS = 2
+BUF = SIZE * SS
+FDIR = "C:\\Windows\\Fonts\\"
+_FONT_CACHE = {}
+
+
+def _font(name, px):
+    """Cache font truetype (px = pixel pada buffer supersample)."""
+    px = max(1, int(px))
+    key = (name, px)
+    f = _FONT_CACHE.get(key)
+    if f is None:
+        try:
+            f = ImageFont.truetype(FDIR + name, px)
+        except Exception:
+            f = ImageFont.load_default()
+        if len(_FONT_CACHE) > 96:
+            _FONT_CACHE.clear()
+        _FONT_CACHE[key] = f
+    return f
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 try:
@@ -408,10 +432,7 @@ class WrapIP(ctk.CTk):
         self.notice = ""
         self.hover = None
         self._drag = None
-        self.k = 1.0                # skala ukuran (scroll mouse)
-        self.k_target = 1.0
-        self._rgn_after = None
-        self._zoom_dirty = False
+        self.k = 1.0                # skala tetap (ukuran permanen)
         self._prev = time.time()
 
         self.canvas = tk.Canvas(
@@ -424,10 +445,13 @@ class WrapIP(ctk.CTk):
         self.canvas.bind("<Motion>", self.on_motion)
         self.canvas.bind("<Leave>", lambda e: self._set_hover(None))
         self.canvas.bind("<Button-3>", self.on_menu)
-        self.canvas.bind("<MouseWheel>", self.on_wheel)
-        self.canvas.bind("<Button-4>", lambda e: self.on_wheel(e, 1))
-        self.canvas.bind("<Button-5>", lambda e: self.on_wheel(e, -1))
         self.bind("<Escape>", lambda e: self.quit())
+        self.bind("<Map>", self.on_map)
+        self._minimizing = False
+        self._in_map = False
+        self._img_id = self.canvas.create_image(0, 0, anchor="nw")
+        self._photo = None
+        self._sig_cache = None
 
         self._load_pos()
         self.update_idletasks()
@@ -435,100 +459,23 @@ class WrapIP(ctk.CTk):
         self.after(40, self._tick)
         self.after(250, self._auto_start)
 
-    # -- skala ukuran ------------------------------------------------
-    def _fs(self, size):
-        """Ukuran font mengikuti skala (canvas.scale tidak mengubah font)."""
-        return max(1, int(round(size * self.k)))
-
-    def _lw(self, px):
-        """Lebar garis mengikuti skala."""
-        return max(1, int(round(px * self.k)))
-
+    # -- ukuran permanen ---------------------------------------------
     def _win_size(self):
-        return int(round(SIZE * self.k))
-
-    def on_wheel(self, e, direction=None):
-        # mouse resolusi tinggi mengirim banyak delta kecil: akumulasi dulu
-        # 120 unit = 1 langkah (standar Windows)
-        if direction is not None:
-            steps = direction
-        else:
-            self._wheel_acc = getattr(self, "_wheel_acc", 0) + getattr(e, "delta", 0)
-            steps = int(self._wheel_acc / 120)
-            if steps == 0:
-                return
-            self._wheel_acc -= steps * 120
-        kt = round(self.k_target + steps * K_STEP, 3)
-        self.k_target = max(K_MIN, min(K_MAX, kt))
-
-    def _zoom_tick(self, dt):
-        # ukuran mengejar target dengan halus (tidak ada geometry thrash).
-        # langkah dibatasi agar konten vs jendela tidak pernah selisih jauh.
-        if abs(self.k_target - self.k) < 0.0008:
-            if self._zoom_dirty:
-                self._zoom_dirty = False
-                self._save_pos()
-            return
-        step = (self.k_target - self.k) * min(1.0, dt * 9.0)
-        if step > 0.045:
-            step = 0.045
-        elif step < -0.045:
-            step = -0.045
-        self.k += step
-        if abs(self.k_target - self.k) < 0.0025:
-            self.k = self.k_target
-        self._zoom_dirty = True
-        self._apply_size(self._win_size())
-
-    def _apply_size(self, n=None):
-        n = self._win_size() if n is None else n
-        x, y = self.winfo_x(), self.winfo_y()
-        if x < 0:
-            x = 0
-        if y < 0:
-            y = 0
-        # jangan sampai keluar layar saat membesar
-        try:
-            sw = ctypes.windll.user32.GetSystemMetrics(0)
-            sh = ctypes.windll.user32.GetSystemMetrics(1)
-            x = min(x, max(0, sw - n))
-            y = min(y, max(0, sh - n))
-        except Exception:
-            pass
-        self.geometry("%dx%d+%d+%d" % (n, n, x, y))
-        # region bulat mengikuti ukuran yang DIMINTA (bukan winfo yang lag),
-        # di-debounce agar tidak balapan saat scroll deras
-        try:
-            if self._rgn_after is not None:
-                self.after_cancel(self._rgn_after)
-        except Exception:
-            pass
-        try:
-            self._rgn_after = self.after(150, lambda nn=n: self._round_region(nn))
-        except Exception:
-            pass
+        return SIZE
 
     # -- config posisi ----------------------------------------------
     def _load_pos(self):
-        self.k = self.k_target = 1.0
         try:
+            x = y = -1
             if os.path.exists(CONFIG_PATH):
                 cfg = json.load(open(CONFIG_PATH, encoding="utf-8"))
-                try:
-                    self.k = max(K_MIN, min(K_MAX, float(cfg.get("k", 1.0))))
-                except Exception:
-                    pass
-                self.k_target = self.k
                 x, y = int(cfg.get("x", -1)), int(cfg.get("y", -1))
-                n = self._win_size()
-                sw = ctypes.windll.user32.GetSystemMetrics(0)
-                sh = ctypes.windll.user32.GetSystemMetrics(1)
-                if x >= 0 and y >= 0 and x + n <= sw and y + n <= sh:
-                    self.geometry("%dx%d+%d+%d" % (n, n, x, y))
-                    return
             n = self._win_size()
             sw = ctypes.windll.user32.GetSystemMetrics(0)
             sh = ctypes.windll.user32.GetSystemMetrics(1)
+            if x >= 0 and y >= 0 and x + n <= sw and y + n <= sh:
+                self.geometry("%dx%d+%d+%d" % (n, n, x, y))
+                return
             self.geometry("%dx%d+%d+%d" % (n, n, sw - n - 40, sh - n - 60))
         except Exception:
             pass
@@ -536,20 +483,49 @@ class WrapIP(ctk.CTk):
     def _save_pos(self):
         try:
             json.dump(
-                {"x": self.winfo_x(), "y": self.winfo_y(), "k": round(self.k, 3)},
+                {"x": self.winfo_x(), "y": self.winfo_y()},
                 open(CONFIG_PATH, "w", encoding="utf-8"),
                 indent=2,
             )
         except Exception:
             pass
 
+    def _real_hwnd(self):
+        # winfo_id() bisa mengembalikan TkChild dalam (bukan top-level);
+        # naik ke induk teratas agar region tepat sasaran.
+        try:
+            u = ctypes.windll.user32
+            u.GetParent.argtypes = [ctypes.c_void_p]
+            u.GetParent.restype = ctypes.c_void_p
+            h = self.winfo_id()
+            for _ in range(4):
+                try:
+                    p = u.GetParent(h)
+                except Exception:
+                    break
+                if not p:
+                    break
+                h = p
+            return h
+        except Exception:
+            pass
+        try:
+            return self.winfo_id()
+        except Exception:
+            return None
+
     def _round_region(self, n=None):
         try:
-            self._rgn_after = None
+            u = ctypes.windll.user32
+            g = ctypes.windll.gdi32
+            g.CreateEllipticRgn.argtypes = [ctypes.c_int] * 4
+            g.CreateEllipticRgn.restype = ctypes.c_void_p
+            u.SetWindowRgn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+            u.SetWindowRgn.restype = ctypes.c_bool
             if n is None:
                 n = max(self.winfo_width(), self.winfo_height())
-            rgn = ctypes.windll.gdi32.CreateEllipticRgn(0, 0, n + 1, n + 1)
-            ctypes.windll.user32.SetWindowRgn(self.winfo_id(), rgn, True)
+            rgn = g.CreateEllipticRgn(0, 0, n + 1, n + 1)
+            u.SetWindowRgn(self._real_hwnd(), rgn, True)
         except Exception:
             pass
 
@@ -579,58 +555,62 @@ class WrapIP(ctk.CTk):
             "err": "GAGAL",
         }.get(self.phase, "SIAP")
 
-    # -- menggambar -------------------------------------------------
-    def _round_rect(self, x0, y0, x1, y1, r, fill, border=None, bw=1.5):
-        c = self.canvas
-        if border:
-            b = self._lw(bw)
-            self._round_rect(x0 - b, y0 - b, x1 + b, y1 + b, r + b, fill=border)
-        c.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline="")
-        c.create_rectangle(x0, y0 + r, x1, y1 - r, fill=fill, outline="")
-        for ox, oy in ((x0, y0), (x1 - 2 * r, y0), (x0, y1 - 2 * r), (x1 - 2 * r, y1 - 2 * r)):
-            c.create_oval(ox, oy, ox + 2 * r, oy + 2 * r, fill=fill, outline="")
-
-    def _band(self, deg0, deg1, color, r=None, w=None):
-        """Pita busur sebagai polygon isi (ikut skala penuh, ujung bisa rounded).
-        span bertanda: negatif = searah jarum jam (mengikuti arah bar)."""
+# -- menggambar (PIL supersampling: sehalus vektor) -----------------
+    def _band_pil(self, d, u, deg0, deg1, color, r=None, w=None):
         r = R_GAUGE if r is None else r
         w = W_GAUGE if w is None else w
         ro, ri = r + w / 2.0, r - w / 2.0
         span = deg1 - deg0
-        n = max(6, int(abs(span) / 4.0))
+        n = max(8, int(abs(span) / 1.5))
         pts = []
         for i in range(n + 1):
             x, y = polar(deg0 + span * i / n, ro)
-            pts.extend((x, y))
+            pts.append((x * u, y * u))
         for i in range(n, -1, -1):
             x, y = polar(deg0 + span * i / n, ri)
-            pts.extend((x, y))
-        self.canvas.create_polygon(pts, fill=color, outline="")
+            pts.append((x * u, y * u))
+        d.polygon(pts, fill=color)
 
-    def _cap(self, deg, color, r=None, w=None):
+    def _cap_pil(self, d, u, deg, color, r=None, w=None):
         r = R_GAUGE if r is None else r
         w = W_GAUGE if w is None else w
         x, y = polar(deg, r)
-        self.canvas.create_oval(x - w / 2.0, y - w / 2.0, x + w / 2.0, y + w / 2.0,
-                                fill=color, outline="")
+        d.ellipse([u * (x - w / 2.0), u * (y - w / 2.0),
+                   u * (x + w / 2.0), u * (y + w / 2.0)], fill=color)
+
+    def _sig(self):
+        g = self.geo
+        return (round(self.value, 2), round(self.vmax, 1), self.phase, self.ping,
+                self.down, self.up, self.ip, g.get("kota"), g.get("negara"),
+                 self.connected, self.proxy, self.busy, self.notice, self.hover)
 
     def render(self):
-        c = self.canvas
-        c.delete("all")
+        sig = self._sig()
+        if sig == self._sig_last():
+            return
+        self._sig_last_set(sig)
+
+        u = self.k * SS
+        n = self._win_size()
         acc = self._accent()
+        img = Image.new("RGBA", (BUF, BUF), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+
+        def lw(px):
+            return max(1, int(round(px * u)))
+
+        def ft(name, px):
+            return _font(name, px * u)
 
         # badan lingkaran
-        c.create_oval(
-            CX - R_BODY, CY - R_BODY, CX + R_BODY, CY + R_BODY,
-            fill=BODY, outline=EDGE, width=self._lw(1)
-        )
-        c.create_oval(
-            CX - R_EDGE, CY - R_EDGE, CX + R_EDGE, CY + R_EDGE, outline=EDGE2, width=self._lw(2)
-        )
-        c.create_oval(
-            CX - R_EDGE + 6, CY - R_EDGE + 6, CX + R_EDGE - 6, CY + R_EDGE - 6,
-            outline="#1A2029", width=self._lw(1)
-        )
+        d.ellipse([u * (CX - R_BODY), u * (CY - R_BODY),
+                   u * (CX + R_BODY), u * (CY + R_BODY)],
+                  fill=BODY, outline=EDGE, width=lw(1))
+        d.ellipse([u * (CX - R_EDGE), u * (CY - R_EDGE),
+                   u * (CX + R_EDGE), u * (CY + R_EDGE)], outline=EDGE2, width=lw(2))
+        e3 = R_EDGE - 6
+        d.ellipse([u * (CX - e3), u * (CY - e3),
+                   u * (CX + e3), u * (CY + e3)], outline="#1A2029", width=lw(1))
 
         # tick meter analog
         n_ticks = 24
@@ -646,33 +626,33 @@ class WrapIP(ctk.CTk):
             col = EDGE2 if not major else DIM
             if self.value > 0:
                 col = acc if frac <= cur else (DIM if major else EDGE2)
-            c.create_line(x1, y1, x2, y2, fill=col, width=self._lw(2 if major else 1))
+            d.line([u * x1, u * y1, u * x2, u * y2], fill=col, width=lw(2 if major else 1))
 
         # track busur (ujung rata)
-        self._band(A_START, A_START + A_SWEEP, TRACK)
+        self._band_pil(d, u, A_START, A_START + A_SWEEP, TRACK)
 
         # bar dari angka 0, searah jarum jam, ujung rounded
         frac = max(0.0, min(1.0, cur))
         if frac > 0.002:
             end = A_START + frac * A_SWEEP
-            self._band(A_START, end, acc)
-            self._cap(A_START, acc)
-            self._cap(end, acc)
-            # highlight tipis di dalam bar (ujung rounded juga, biar tidak ada-notch)
+            self._band_pil(d, u, A_START, end, acc)
+            self._cap_pil(d, u, A_START, acc)
+            self._cap_pil(d, u, end, acc)
             hw = W_GAUGE - 8
             lo = min(end, A_START) + 2.2
             hb = max(end, A_START) - 2.2
             if hb - lo > 1.0:
                 hi = self._lighten(acc, 0.22)
-                self._band(lo, hb, hi, w=hw)
-                self._cap(lo, hi, w=hw)
-                self._cap(hb, hi, w=hw)
+                self._band_pil(d, u, lo, hb, hi, w=hw)
+                self._cap_pil(d, u, lo, hi, w=hw)
+                self._cap_pil(d, u, hb, hi, w=hw)
 
         # skala: 0 dan max tepat di ujung bar
         lx, ly = polar(A_START, Y_LABEL)
         rx, ry = polar(A_START + A_SWEEP, Y_LABEL)
-        c.create_text(lx, ly, text="0", font=(FONT, self._fs(10)), fill=FAINT)
-        c.create_text(rx, ry, text="%d" % int(self.vmax), font=(FONT, self._fs(10)), fill=FAINT)
+        f_lab = ft("segoeui.ttf", 13)
+        d.text((u * lx, u * ly), "0", font=f_lab, fill=FAINT, anchor="mm")
+        d.text((u * rx, u * ry), "%d" % int(self.vmax), font=f_lab, fill=FAINT, anchor="mm")
 
         # nilai besar
         if self.phase in ("boot", "ping", "down", "up", "proxy", "err"):
@@ -680,25 +660,33 @@ class WrapIP(ctk.CTk):
         else:
             best = max([v for v in (self.down, self.up) if v] or [0])
             big = "%.1f" % best if best > 0 else "--"
-        c.create_text(CX, Y_VALUE, text=big, font=(FONT, self._fs(34), "bold"), fill=TXT)
-        c.create_text(CX, Y_UNIT, text="Mbps", font=(FONT, self._fs(11)), fill=DIM)
-        c.create_text(CX, Y_PHASE, text=self._phase_text(), font=(FONT, self._fs(8), "bold"),
-                      fill=acc if self.phase != "ready" else DIM)
+        d.text((u * CX, u * Y_VALUE), big, font=ft("segoeuib.ttf", 45), fill=TXT, anchor="mm")
+        d.text((u * CX, u * Y_UNIT), "Mbps", font=ft("segoeui.ttf", 15), fill=DIM, anchor="mm")
+        d.text((u * CX, u * Y_PHASE), self._phase_text(), font=ft("segoeuib.ttf", 11),
+               fill=acc if self.phase != "ready" else DIM, anchor="mm")
 
         # garis pemisah
-        c.create_line(CX - 56, Y_RULE, CX + 56, Y_RULE, fill=EDGE, width=self._lw(1))
+        d.line([u * (CX - 56), u * Y_RULE, u * (CX + 56), u * Y_RULE], fill=EDGE, width=lw(1))
 
         # ip + ping
         ip_txt = self.ip if len(self.ip) <= 15 else "..." + self.ip[-12:]
-        c.create_text(CX, Y_IP, text="IP %s" % ip_txt,
-                      font=(FONT_MONO, self._fs(9), "bold"), fill=TXT)
+        d.text((u * CX, u * Y_IP), "IP %s" % ip_txt,
+               font=ft("consolab.ttf", 12), fill=TXT, anchor="mm")
         ping_txt = "%d ms" % self.ping if self.ping >= 0 else "-- ms"
-        c.create_text(CX, Y_GEO, text="%s  \u00b7  %s" % (ping_txt, self.geo.get("kota", "-")),
-                      font=(FONT, self._fs(9)), fill=DIM)
+        d.text((u * CX, u * Y_GEO), "%s  \u00b7  %s" % (ping_txt, self.geo.get("kota", "-")),
+               font=ft("segoeui.ttf", 12), fill=DIM, anchor="mm")
 
         # tombol kecil
-        self._small_button(SMALL_L, "\u21bb", "refresh", FAINT)
-        self._small_button(SMALL_R_POS, "\u2715", "close", C_WARN)
+        f_glyph = ft("seguisym.ttf", 17)
+        for (bx, by), glyph, tag, col in (
+                (SMALL_L, "\u21bb", "refresh", FAINT),
+                (SMALL_M_POS, "\u2212", "min", FAINT),
+                (SMALL_R_POS, "\u2715", "close", C_WARN)):
+            hot = self.hover == tag
+            rr = SMALL_R + (2 if hot else 0)
+            d.ellipse([u * (bx - rr), u * (by - rr), u * (bx + rr), u * (by + rr)],
+                      fill=col if hot else BODY, outline=col, width=lw(1))
+            d.text((u * bx, u * by), glyph, font=f_glyph, fill=BODY if hot else col, anchor="mm")
 
         # card connect / disconnect
         x0, x1 = CX - CARD_W / 2, CX + CARD_W / 2
@@ -713,14 +701,22 @@ class WrapIP(ctk.CTk):
             fill = "#122019" if hot else "#0D1613"
             border = "#2E5A4C" if hot else "#22322C"
             title, sub = "CONNECT", self._status_line()
-        self._round_rect(x0, y0, x1, y1, CARD_R, fill, border, 1.5)
-        c.create_text(CX, y0 + 15, text=title, font=(FONT, self._fs(12), "bold"),
-                      fill=(DIM if self.busy else (C_WARN if self.connected else C_DOWN)))
-        c.create_text(CX, y0 + 30, text=sub[:22], font=(FONT, self._fs(8)),
-                      fill=DIM if not self.busy else FAINT)
+        d.rounded_rectangle([u * x0, u * y0, u * x1, u * y1], radius=int(CARD_R * u),
+                            fill=fill, outline=border, width=lw(1.5))
+        d.text((u * CX, u * (y0 + 15)), title, font=ft("segoeuib.ttf", 16),
+               fill=(DIM if self.busy else (C_WARN if self.connected else C_DOWN)), anchor="mm")
+        d.text((u * CX, u * (y0 + 30)), sub[:22], font=ft("segoeui.ttf", 11),
+               fill=DIM if not self.busy else FAINT, anchor="mm")
 
-        # semua geometry ikut ukuran widget (canvas.scale tidak mengubah font/line width)
-        c.scale("all", 0, 0, self.k, self.k)
+        img = img.resize((n, n), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas.itemconfig(self._img_id, image=self._photo)
+
+    def _sig_last(self):
+        return getattr(self, "_sig_cache", None)
+
+    def _sig_last_set(self, sig):
+        self._sig_cache = sig
 
     def _status_line(self):
         if self.notice:
@@ -728,15 +724,6 @@ class WrapIP(ctk.CTk):
         if self.phase == "proxy":
             return "mencari proxy..."
         return "ganti IP publik"
-
-    def _small_button(self, pos, glyph, tag, col):
-        x, y = pos
-        hot = self.hover == tag
-        r = SMALL_R + (2 if hot else 0)
-        self.canvas.create_oval(x - r, y - r, x + r, y + r,
-                                fill=col if hot else BODY, outline=col, width=self._lw(1))
-        self.canvas.create_text(x, y, text=glyph, font=(FONT, self._fs(11), "bold"),
-                                fill=BODY if hot else col)
 
     @staticmethod
     def _lighten(hex_color, f=0.35):
@@ -758,6 +745,8 @@ class WrapIP(ctk.CTk):
             return None
         if math.hypot(x - SMALL_L[0], y - SMALL_L[1]) <= SMALL_R + 5:
             return "refresh"
+        if math.hypot(x - SMALL_M_POS[0], y - SMALL_M_POS[1]) <= SMALL_R + 5:
+            return "min"
         if math.hypot(x - SMALL_R_POS[0], y - SMALL_R_POS[1]) <= SMALL_R + 5:
             return "close"
         if abs(x - CX) <= CARD_W / 2 and CARD_Y0 <= y <= CARD_Y0 + CARD_H:
@@ -788,10 +777,109 @@ class WrapIP(ctk.CTk):
         hit = self._hit(e.x, e.y)
         if hit == "close":
             self.quit()
+        elif hit == "min":
+            self.minimize_win()
         elif hit == "refresh":
             self.start_speedtest()
         elif hit == "main":
             self.toggle_connection()
+
+    def minimize_win(self):
+        # borderless tidak punya tombol taskbar: lepas border dulu,
+        # minimize, lalu pasang lagi saat restore (on_map).
+        # Flag: Map yang muncul dari toggle ini BUKAN restore -> abaikan.
+        self._minimizing = True
+        try:
+            self.overrideredirect(False)
+            self.update_idletasks()
+            self.iconify()
+        except Exception:
+            self._minimizing = False
+
+    def on_map(self, _e=None):
+        # Map dari toggle saat minimize (flag) = abaikan, jangan restore.
+        if getattr(self, "_minimizing", False):
+            self._minimizing = False
+            return
+        if getattr(self, "_in_map", False):
+            return
+        # toggle borderless MENGHANCURKAN HWND: jangan lakukan di dalam
+        # handler Map (transisi map belum selesai) -> tunda ke idle.
+        self._in_map = True
+        try:
+            self.after(60, self._finish_restore)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.after(500, lambda: setattr(self, "_in_map", False))
+            except Exception:
+                self._in_map = False
+
+    def _finish_restore(self):
+        # map sudah selesai -> baru aman toggle borderless + pulihkan semua
+        try:
+            self.attributes("-transparentcolor", KEY)
+        except Exception:
+            pass
+        try:
+            self.deiconify()
+        except Exception:
+            pass
+        try:
+            self.overrideredirect(True)
+        except Exception:
+            pass
+        try:
+            self.attributes("-transparentcolor", KEY)
+        except Exception:
+            pass
+        try:
+            n = self._win_size()
+            self.geometry("%dx%d" % (n, n))
+        except Exception:
+            pass
+        try:
+            self.deiconify()
+            self.lift()
+        except Exception:
+            pass
+        # HWND baru dari toggle bisa belum stabil: pasang ulang berlapis
+        for ms in (80, 200, 500, 1000):
+            try:
+                self.after(ms, self._reclip)
+            except Exception:
+                pass
+
+    def _reclip(self):
+        try:
+            self.attributes("-transparentcolor", "#000002")
+        except Exception:
+            pass
+        try:
+            self.attributes("-transparentcolor", KEY)
+        except Exception:
+            pass
+        try:
+            self._hwnd_seen = self.winfo_id()
+        except Exception:
+            pass
+        try:
+            self.deiconify()
+        except Exception:
+            pass
+        try:
+            self._round_region(self._win_size())
+        except Exception:
+            pass
+        try:
+            self.render()
+        except Exception:
+            pass
+        try:
+            self.lift()
+        except Exception:
+            pass
 
     def on_menu(self, e):
         m = tk.Menu(self, tearoff=0, bg=BODY, fg=TXT, activebackground=EDGE)
@@ -818,6 +906,19 @@ class WrapIP(ctk.CTk):
             # denyut halus: 22% .. 52% skala
             pulse = 0.22 + 0.15 * (0.5 + 0.5 * math.sin(now * 3.4))
             self.value += (self.vmax * pulse - self.value) * min(1.0, dt * 7.0)
+        elif self.phase == "ready":
+            # simulasi lalu lintas data: naik-turun organik (3 sinus + basis)
+            self._idle_t = getattr(self, "_idle_t", 0.0) + dt
+            t = self._idle_t
+            base = (self.down or 0)
+            if base <= 0:
+                base = self.vmax * 0.3
+            wave = (0.62
+                    + 0.22 * math.sin(t * 2.3)
+                    + 0.11 * math.sin(t * 5.1 + 1.7)
+                    + 0.05 * math.sin(t * 11.3 + 0.6))
+            idle_target = max(0.5, base * wave)
+            self.value += (idle_target - self.value) * min(1.0, dt * 6.0)
         else:
             # easing eksponensial, waktu-independent, turun lebih cepat
             tau = 0.085 if self.target < self.value else 0.16
@@ -825,9 +926,31 @@ class WrapIP(ctk.CTk):
             if abs(self.target - self.value) < 0.015:
                 self.value = self.target
 
-        self._zoom_tick(dt)  # update k + geometry DULU ...
+        # jaga transparan tetap menempel: Tk meng-cache nilainya, jadi
+        # set ulang nilai SAMA = no-op di HWND baru -> deteksi ganti HWND,
+        # paksa via nilai beda dulu baru kunci lagi (tanpa flicker).
         try:
-            self.render()  # ... baru gambar pakai k terbaru
+            if self.winfo_viewable():
+                hid = self.winfo_id()
+                if hid != getattr(self, "_hwnd_seen", None):
+                    self._hwnd_seen = hid
+                    try:
+                        self.attributes("-transparentcolor", "#000002")
+                    except Exception:
+                        pass
+                    try:
+                        self.attributes("-transparentcolor", KEY)
+                    except Exception:
+                        pass
+                    try:
+                        self._round_region(self._win_size())
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            self.render()
         except Exception:
             pass
         try:

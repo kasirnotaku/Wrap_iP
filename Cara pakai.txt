@@ -6,6 +6,7 @@ berjalan seperti aplikasi speedtest Ookla, TANPA jarum.
 Cara pakai
 ----------
 1. Jalankan:  python wrapip.py
+   (butuh: pip install customtkinter pillow)
    (atau klik WrapIP.exe hasil build, tanpa jendela CMD)
 
 2. Otomatis saat dibuka:
