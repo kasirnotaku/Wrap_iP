@@ -1,0 +1,16 @@
+# build & distribusi
+build/
+dist/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# config lokal (posisi + ukuran widget per mesin)
+wrapip_config.json
+
+# log / sementara
+*.log
+out.txt
+err.txt

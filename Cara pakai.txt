@@ -1,0 +1,43 @@
+WrapIP — Mini Analog Meter v3 (tanpa jarum)
+===========================================
+Meter bulat transparan ala widget desktop: busur 270° yang "bar"-nya
+berjalan seperti aplikasi speedtest Ookla, TANPA jarum.
+
+Cara pakai
+----------
+1. Jalankan:  python wrapip.py
+   (atau klik WrapIP.exe hasil build, tanpa jendela CMD)
+
+2. Otomatis saat dibuka:
+   - cari IP publik + kota/ISP
+   - ukur ping, download, upload (bar bergerak realtime)
+
+3. Card di bawah (sisi melengkung):
+   - CONNECT     : cari proxy lalu pasang proxy sistem Windows (ganti IP)
+   - DISCONNECT  : matikan proxy, kembali ke IP asli
+   Baris bawah card menampilkan proxy yang sedang dipakai.
+   Card abu-abu = sedang proses, card merah = tersambung.
+
+   Warna bar: hijau = download, biru = upload, kuning = ping/proxy,
+   abu-abu = siap. Angka 0 dan max berada tepat di ujung bar.
+
+4. Geser dari area mana saja untuk memindahkan posisi (tersimpan otomatis).
+   Selalu tampil di atas jendela lain.
+   Klik kanan: ulangi speedtest / perbarui IP / keluar.
+
+   (↻) kiri atas: ulangi speedtest   (✕) kanan atas: tutup
+
+5. Ukuran: SCROLL MOUSE di atas meter
+   scroll up = besar, scroll down = kecil (55% - 180%).
+   Ukuran & posisi tersimpan otomatis.
+
+Catatan
+-------
+- Proxy diambil dari daftar proxy publik gratis, jadi konektivitas
+  tidak 100% dan sebagian besar proxy hanya support HTTP.
+- Fungsi ganti IP hanya di Windows (butuh izin registry user).
+- File: wrapip.py | posisi + ukuran tersimpan di wrapip_config.json
+
+Build EXE
+---------
+pyinstaller --clean --noconfirm WrapIP.spec
